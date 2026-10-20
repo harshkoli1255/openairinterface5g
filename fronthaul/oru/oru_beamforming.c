@@ -54,6 +54,9 @@ static void combine_codebook(c16_t **txDataF,
       LOG_W(PHY, "beam_id %u out of range (nb_beams=%d), falling back to beam 0\n", stream->beam_id, cb->nb_beams);
       bidx = 0;
     }
+    c16_t w[ORU_MAX_BF_WEIGHTS];
+    for (int txru = 0; txru < nb_tx; txru++)
+      w[txru] = cb->w[bidx][txru][stream->ant_id];
     const c16_t *src = (const c16_t *)stream->iq;
     const int n_re = stream->num_prb * NR_NB_SC_PER_RB;
     const int re_off = stream->start_prb * NR_NB_SC_PER_RB;
@@ -61,7 +64,7 @@ static void combine_codebook(c16_t **txDataF,
       // Fold rotation into the weight once, instead of a separate rotate pass afterward. Fused
       // multiply+saturating-accumulate straight into txDataF - no scratch buffer, one pass. The fold
       // saturates too: weights are arbitrary int16 from config, so w * rotation can exceed Q1.15.
-      c16_t w_rot = c16mulShiftSat(cb->w[bidx][txru][stream->ant_id], rotation, 15);
+      c16_t w_rot = c16mulShiftSat(w[txru], rotation, 15);
       rotate_add_cpx_vector(src, w_rot, &txDataF[txru][re_off], n_re, 15);
     }
   }
@@ -82,6 +85,43 @@ void combine_dl_streams(c16_t **txDataF,
   }
 }
 
+// out[k] = sum_a conj(w[a]) * fft_data[a][k] over bins [k0, k0 + nk), a < nb_ant
+static void combine_ul_weights(const c16_t *const fft_data[], int nb_ant, int k0, int nk, const c16_t *w, c16_t *out)
+{
+  memset(&out[k0], 0, nk * sizeof(c16_t));
+  for (int a = 0; a < nb_ant; a++) {
+    // Same per-bin saturating multiply-accumulate as the DL codebook path, with the conjugate
+    // (receive) weight: see the header for why UL uses w^H.
+    const c16_t w_rx = {.r = w[a].r, .i = w[a].i == INT16_MIN ? INT16_MAX : (int16_t)-w[a].i};
+    rotate_add_cpx_vector(&fft_data[a][k0], w_rx, &out[k0], nk, 15);
+  }
+}
+
+// Codebook weights of beam_id for UL stream stream_id into w; returns the antenna count to combine (0: drop stream)
+static int codebook_ul_weights(const oru_codebook_t *cb, int nb_rx, int beam_id, int stream_id, c16_t *w)
+{
+  if (stream_id >= cb->nb_fh_streams) {
+    LOG_W(PHY, "UL stream %d exceeds nb_fh_streams %d, dropping\n", stream_id, cb->nb_fh_streams);
+    return 0;
+  }
+  int bidx = beam_id;
+  if (bidx >= cb->nb_beams) {
+    LOG_W(PHY, "beam_id %u out of range (nb_beams=%d), falling back to beam 0\n", beam_id, cb->nb_beams);
+    bidx = 0;
+  }
+  if (nb_rx > ORU_CODEBOOK_MAX_NB_TX) {
+    LOG_W(PHY,
+          "nb_rx %d exceeds codebook antenna dimension %d, combining first %d antennas\n",
+          nb_rx,
+          ORU_CODEBOOK_MAX_NB_TX,
+          ORU_CODEBOOK_MAX_NB_TX);
+  }
+  const int nb_ant = nb_rx < ORU_CODEBOOK_MAX_NB_TX ? nb_rx : ORU_CODEBOOK_MAX_NB_TX;
+  for (int a = 0; a < nb_ant; a++)
+    w[a] = cb->w[bidx][a][stream_id];
+  return nb_ant;
+}
+
 void combine_ul_beam_fd(const c16_t *const fft_data[],
                         int nb_rx,
                         int k0,
@@ -91,28 +131,29 @@ void combine_ul_beam_fd(const c16_t *const fft_data[],
                         int stream_id,
                         c16_t *out)
 {
-  if (stream_id >= cb->nb_fh_streams) {
-    LOG_W(PHY, "UL stream %d exceeds nb_fh_streams %d, dropping\n", stream_id, cb->nb_fh_streams);
-    memset(&out[k0], 0, nk * sizeof(c16_t));
-    return;
+  c16_t w[ORU_CODEBOOK_MAX_NB_TX];
+  const int nb_ant = codebook_ul_weights(cb, nb_rx, beam_id, stream_id, w);
+  combine_ul_weights(fft_data, nb_ant, k0, nk, w, out);
+}
+
+// combine_ul_weights() over contiguous REs [c0, c1) of an nbins-wide band, laid out as for combine_ul_beam_prbs()
+static void combine_ul_weights_res(const c16_t *const fft_data[],
+                                   int nb_ant,
+                                   int fft_size,
+                                   int nbins,
+                                   int c0,
+                                   int c1,
+                                   const c16_t *w,
+                                   c16_t *out)
+{
+  const int half = nbins / 2;
+  if (c0 < half) { // negative-frequency half: the tail of the FFT window
+    const int end = c1 < half ? c1 : half;
+    combine_ul_weights(fft_data, nb_ant, fft_size - half + c0, end - c0, w, out);
   }
-  int bidx = beam_id;
-  if (bidx >= cb->nb_beams) {
-    LOG_W(PHY, "beam_id %u out of range (nb_beams=%d), falling back to beam 0\n", beam_id, cb->nb_beams);
-    bidx = 0;
-  }
-  memset(&out[k0], 0, nk * sizeof(c16_t));
-  if (nb_rx > ORU_CODEBOOK_MAX_NB_TX) {
-    LOG_W(PHY, "nb_rx %d exceeds codebook antenna dimension %d, combining first %d antennas\n",
-          nb_rx, ORU_CODEBOOK_MAX_NB_TX, ORU_CODEBOOK_MAX_NB_TX);
-  }
-  const int nb_ant = nb_rx < ORU_CODEBOOK_MAX_NB_TX ? nb_rx : ORU_CODEBOOK_MAX_NB_TX;
-  for (int a = 0; a < nb_ant; a++) {
-    // Same per-bin saturating multiply-accumulate as the DL codebook path, with the conjugate
-    // (receive) weight: see the header for why UL uses w^H.
-    const c16_t w = cb->w[bidx][a][stream_id];
-    const c16_t w_rx = {.r = w.r, .i = w.i == INT16_MIN ? INT16_MAX : (int16_t)-w.i};
-    rotate_add_cpx_vector(&fft_data[a][k0], w_rx, &out[k0], nk, 15);
+  if (c1 > half) { // DC and positive-frequency half: the head of the FFT window
+    const int lo = c0 > half ? c0 : half;
+    combine_ul_weights(fft_data, nb_ant, lo - half, c1 - lo, w, out);
   }
 }
 
@@ -127,17 +168,12 @@ void combine_ul_beam_prbs(const c16_t *const fft_data[],
                           int stream_id,
                           c16_t *out)
 {
-  const int half = nbins / 2;
-  int c0 = start_prb * NR_NB_SC_PER_RB;
-  int c1 = c0 + num_prb * NR_NB_SC_PER_RB;
-  c0 = c0 < nbins ? c0 : nbins;
-  c1 = c1 < nbins ? c1 : nbins;
-  if (c0 < half) { // negative-frequency half: the tail of the FFT window
-    const int end = c1 < half ? c1 : half;
-    combine_ul_beam_fd(fft_data, nb_rx, fft_size - half + c0, end - c0, cb, beam_id, stream_id, out);
-  }
-  if (c1 > half) { // DC and positive-frequency half: the head of the FFT window
-    const int lo = c0 > half ? c0 : half;
-    combine_ul_beam_fd(fft_data, nb_rx, lo - half, c1 - lo, cb, beam_id, stream_id, out);
-  }
+  const int n_rb = nbins / NR_NB_SC_PER_RB;
+  int end = start_prb + num_prb;
+  end = end < n_rb ? end : n_rb;
+  if (start_prb >= end)
+    return;
+  c16_t w[ORU_CODEBOOK_MAX_NB_TX];
+  const int nb_ant = codebook_ul_weights(cb, nb_rx, beam_id, stream_id, w);
+  combine_ul_weights_res(fft_data, nb_ant, fft_size, nbins, start_prb * NR_NB_SC_PER_RB, end * NR_NB_SC_PER_RB, w, out);
 }
