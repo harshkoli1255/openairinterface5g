@@ -537,6 +537,8 @@ int get_oru_options(ORU_t *oru)
   fh_cfg->numerology = oru->numerology;
   fh_cfg->prach_eaxc_offset = *gpd(fh_param, nump, CONFIG_STRING_PRACH_EAXC_OFFSET)->u8ptr;
   fh_cfg->prach_kbar = *gpd(fh_param, nump, CONFIG_STRING_PRACH_KBAR)->uptr;
+  // Codebook mode also applies ext1/ext11 weights from the DU, one per TXRU
+  fh_cfg->num_bf_weights = oru->codebook.nb_fh_streams > 0 ? oru->ru->nb_tx : 0;
 
   AssertFatal(gpd(fh_param, nump, CONFIG_STRING_T2A_UP)->numelt == 2, "Two parameters required for %s\n", CONFIG_STRING_T2A_UP);
   fh_cfg->T2a_up_min_uS = gpd(fh_param, nump, CONFIG_STRING_T2A_UP)->iptr[0];
@@ -731,7 +733,8 @@ static void assemble_dl_symbol(ORU_t *oru,
   const int n_sc = n_rb_dl * NR_NB_SC_PER_RB;
   c16_t rotation = *(fp->symbol_rotation[0] + (slot % fp->slots_per_subframe) * fp->symbols_per_slot + symbol);
 
-  combine_dl_streams(txDataF, ru->nb_tx, n_sc, streams, num_streams, &oru->codebook, NULL, rotation);
+  const oru_bfw_source_t bfw = {.ctx = oru->fronthaul, .get = oru_fh_get_bf_weights};
+  combine_dl_streams(txDataF, ru->nb_tx, n_sc, streams, num_streams, &oru->codebook, &bfw, rotation);
 }
 
 static pthread_mutex_t south_read_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -956,9 +959,10 @@ static void receive_pusch(ORU_t *oru, int frame, int slot, int symbol, ul_job_t 
   const int nbins = fp->N_RB_UL * NR_NB_SC_PER_RB;
   c16_t rxdataF_fft[fp->ofdm_symbol_size] __attribute__((aligned(32)));
   if (beamforming) {
-    // UL Rx beamforming: combine the per-antenna FFTs via the codebook, only over the PRBs this job
-    // sends (the rest of the window is zero and never leaves the O-RU).
+    // UL Rx beamforming: combine the per-antenna FFTs via the codebook or the DU's weights, only over the PRBs this
+    // job sends (the rest of the window is zero and never leaves the O-RU).
     memset(rxdataF_fft, 0, sizeof(rxdataF_fft));
+    const oru_bfw_source_t bfw = {.ctx = oru->fronthaul, .get = oru_fh_get_bf_weights};
     combine_ul_beam_prbs(ant_fft,
                          ru->nb_rx,
                          fp->ofdm_symbol_size,
@@ -968,8 +972,8 @@ static void receive_pusch(ORU_t *oru, int frame, int slot, int symbol, ul_job_t 
                          cb,
                          job->beam_id,
                          aarx,
-                         NULL,
-                         NULL,
+                         &bfw,
+                         &job->bfw,
                          rxdataF_fft);
   } else {
     // No beamforming: perform FFT on the received antenna's time-domain signal

@@ -47,6 +47,7 @@ typedef struct {
   oru_fh_tdd_pattern_t tdd_pattern;
   int prach_eaxc_offset;
   int prach_kbar;
+  int num_bf_weights; // (bfwI, bfwQ) pairs per ext1/ext11 weight vector; 0 ignores dynamic weights
 } oru_fh_config_t;
 
 /**
@@ -143,6 +144,18 @@ int oru_fh_poll_ul_job(void *handle, ul_job_t *job);
  * @return The beam id, or -1 when no PRACH C-Plane is active for that slot and stream.
  */
 int oru_fh_get_prach_beam_id(void *handle, int slot, int stream);
+
+/**
+ * @brief Copy the dynamic weights of one PRB bundle of a stream or job, see get_bf_weights().
+ *
+ * @param handle Pointer to the fronthaul handle.
+ * @param set Weights handle of a DL stream or UL job (dl_iq_stream_t.bfw, ul_job_t.bfw).
+ * @param bundle Bundle index, 0..set->num_bundles - 1.
+ * @param beam_id Set to the bundle's beamId, unless -1 is returned.
+ * @param weights Filled with the weights, at least ORU_MAX_BF_WEIGHTS entries.
+ * @return The weight count, 0 to use the codebook for *beam_id, or -1 if the weights were overwritten (skip the bundle).
+ */
+int oru_fh_get_bf_weights(void *handle, const oru_bfw_set_t *set, int bundle, uint16_t *beam_id, c16_t *weights);
 
 /**
  * @brief Get the DL-direction symbol bitmask for the configured TDD pattern.
