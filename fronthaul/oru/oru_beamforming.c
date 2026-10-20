@@ -6,6 +6,7 @@
 #include "openair1/PHY/TOOLS/tools_defs.h"
 #include "common/utils/nr/nr_common.h"
 #include "log.h"
+#include <stdbool.h>
 #include <string.h>
 
 static void combine_passthrough(c16_t **txDataF,
@@ -31,12 +32,40 @@ static void combine_passthrough(c16_t **txDataF,
   }
 }
 
+// Splits PRBs [prb, end) at the next bundle boundary of set and returns the end of the run starting at prb. Returns in
+// *num_w the dynamic weight count of the run's bundle (weights in w), -1 to skip the run because its weights were
+// overwritten, or 0 to use the codebook for *beam_id, which the caller presets to the section beamId and a bundle without
+// dynamic weights replaces with its own.
+static int bfw_run(const oru_bfw_source_t *bfw, const oru_bfw_set_t *set, int prb, int end, int *beam_id, c16_t *w, int *num_w)
+{
+  *num_w = 0;
+  if (bfw == NULL || set->num_bundles == 0)
+    return end;
+  int run_end;
+  if (prb < set->first_prb) {
+    run_end = set->first_prb;
+  } else {
+    int b = oru_bfw_bundle(set, prb);
+    if (b >= set->num_bundles)
+      return end;
+    run_end = set->first_prb + (b + 1) * set->bundle_prbs;
+    uint16_t bundle_beam;
+    int n = bfw->get(bfw->ctx, set, b, &bundle_beam, w);
+    if (n != 0)
+      *num_w = n;
+    else
+      *beam_id = bundle_beam;
+  }
+  return run_end < end ? run_end : end;
+}
+
 static void combine_codebook(c16_t **txDataF,
                              int nb_tx,
                              int n_sc,
                              const dl_iq_stream_t *streams,
                              int num_streams,
                              const oru_codebook_t *cb,
+                             const oru_bfw_source_t *bfw,
                              c16_t rotation)
 {
   for (int aatx = 0; aatx < nb_tx; aatx++) {
@@ -49,23 +78,39 @@ static void combine_codebook(c16_t **txDataF,
       LOG_W(PHY, "DL stream ant_id %d exceeds nb_fh_streams %d, dropping\n", stream->ant_id, cb->nb_fh_streams);
       continue;
     }
-    int bidx = stream->beam_id;
-    if (bidx >= cb->nb_beams) {
-      LOG_W(PHY, "beam_id %u out of range (nb_beams=%d), falling back to beam 0\n", stream->beam_id, cb->nb_beams);
-      bidx = 0;
-    }
-    c16_t w[ORU_MAX_BF_WEIGHTS];
-    for (int txru = 0; txru < nb_tx; txru++)
-      w[txru] = cb->w[bidx][txru][stream->ant_id];
-    const c16_t *src = (const c16_t *)stream->iq;
-    const int n_re = stream->num_prb * NR_NB_SC_PER_RB;
-    const int re_off = stream->start_prb * NR_NB_SC_PER_RB;
-    for (int txru = 0; txru < nb_tx; txru++) {
-      // Fold rotation into the weight once, instead of a separate rotate pass afterward. Fused
-      // multiply+saturating-accumulate straight into txDataF - no scratch buffer, one pass. The fold
-      // saturates too: weights are arbitrary int16 from config, so w * rotation can exceed Q1.15.
-      c16_t w_rot = c16mulShiftSat(w[txru], rotation, 15);
-      rotate_add_cpx_vector(src, w_rot, &txDataF[txru][re_off], n_re, 15);
+    const int end = stream->start_prb + stream->num_prb;
+    bool warned = false; // once per stream, not per bundle
+    for (int prb = stream->start_prb; prb < end;) {
+      int bidx = stream->beam_id;
+      c16_t w[ORU_MAX_BF_WEIGHTS];
+      int num_w;
+      const int run_end = bfw_run(bfw, &stream->bfw, prb, end, &bidx, w, &num_w);
+      if (num_w < 0) { // txDataF is already zero there
+        prb = run_end;
+        continue;
+      }
+      if (num_w == 0) {
+        if (bidx >= cb->nb_beams) {
+          if (!warned)
+            LOG_W(PHY, "beam_id %d out of range (nb_beams=%d), falling back to beam 0\n", bidx, cb->nb_beams);
+          warned = true;
+          bidx = 0;
+        }
+        for (int txru = 0; txru < nb_tx; txru++)
+          w[txru] = cb->w[bidx][txru][stream->ant_id];
+        num_w = nb_tx;
+      }
+      const c16_t *src = (const c16_t *)stream->iq + (prb - stream->start_prb) * NR_NB_SC_PER_RB;
+      const int n_re = (run_end - prb) * NR_NB_SC_PER_RB;
+      const int re_off = prb * NR_NB_SC_PER_RB;
+      for (int txru = 0; txru < nb_tx && txru < num_w; txru++) {
+        // Fold rotation into the weight once, instead of a separate rotate pass afterward. Fused
+        // multiply+saturating-accumulate straight into txDataF - no scratch buffer, one pass. The fold
+        // saturates too: weights are arbitrary int16 from config or the DU, so w * rotation can exceed Q1.15.
+        c16_t w_rot = c16mulShiftSat(w[txru], rotation, 15);
+        rotate_add_cpx_vector(src, w_rot, &txDataF[txru][re_off], n_re, 15);
+      }
+      prb = run_end;
     }
   }
 }
@@ -76,12 +121,13 @@ void combine_dl_streams(c16_t **txDataF,
                         const dl_iq_stream_t *streams,
                         int num_streams,
                         const oru_codebook_t *cb,
+                        const oru_bfw_source_t *bfw,
                         c16_t rotation)
 {
   if (cb->nb_fh_streams <= 0) {
     combine_passthrough(txDataF, nb_tx, n_sc, streams, num_streams, rotation);
   } else {
-    combine_codebook(txDataF, nb_tx, n_sc, streams, num_streams, cb, rotation);
+    combine_codebook(txDataF, nb_tx, n_sc, streams, num_streams, cb, bfw, rotation);
   }
 }
 
@@ -97,24 +143,31 @@ static void combine_ul_weights(const c16_t *const fft_data[], int nb_ant, int k0
   }
 }
 
-// Codebook weights of beam_id for UL stream stream_id into w; returns the antenna count to combine (0: drop stream)
-static int codebook_ul_weights(const oru_codebook_t *cb, int nb_rx, int beam_id, int stream_id, c16_t *w)
+// Codebook weights of beam_id for UL stream stream_id into w; returns the antenna count to combine (0: drop stream).
+// Logs only while *warned is false, and sets it when it logs.
+static int codebook_ul_weights(const oru_codebook_t *cb, int nb_rx, int beam_id, int stream_id, c16_t *w, bool *warned)
 {
   if (stream_id >= cb->nb_fh_streams) {
-    LOG_W(PHY, "UL stream %d exceeds nb_fh_streams %d, dropping\n", stream_id, cb->nb_fh_streams);
+    if (!*warned)
+      LOG_W(PHY, "UL stream %d exceeds nb_fh_streams %d, dropping\n", stream_id, cb->nb_fh_streams);
+    *warned = true;
     return 0;
   }
   int bidx = beam_id;
   if (bidx >= cb->nb_beams) {
-    LOG_W(PHY, "beam_id %u out of range (nb_beams=%d), falling back to beam 0\n", beam_id, cb->nb_beams);
+    if (!*warned)
+      LOG_W(PHY, "beam_id %d out of range (nb_beams=%d), falling back to beam 0\n", beam_id, cb->nb_beams);
+    *warned = true;
     bidx = 0;
   }
   if (nb_rx > ORU_CODEBOOK_MAX_NB_TX) {
-    LOG_W(PHY,
-          "nb_rx %d exceeds codebook antenna dimension %d, combining first %d antennas\n",
-          nb_rx,
-          ORU_CODEBOOK_MAX_NB_TX,
-          ORU_CODEBOOK_MAX_NB_TX);
+    if (!*warned)
+      LOG_W(PHY,
+            "nb_rx %d exceeds codebook antenna dimension %d, combining first %d antennas\n",
+            nb_rx,
+            ORU_CODEBOOK_MAX_NB_TX,
+            ORU_CODEBOOK_MAX_NB_TX);
+    *warned = true;
   }
   const int nb_ant = nb_rx < ORU_CODEBOOK_MAX_NB_TX ? nb_rx : ORU_CODEBOOK_MAX_NB_TX;
   for (int a = 0; a < nb_ant; a++)
@@ -132,7 +185,8 @@ void combine_ul_beam_fd(const c16_t *const fft_data[],
                         c16_t *out)
 {
   c16_t w[ORU_CODEBOOK_MAX_NB_TX];
-  const int nb_ant = codebook_ul_weights(cb, nb_rx, beam_id, stream_id, w);
+  bool warned = false;
+  const int nb_ant = codebook_ul_weights(cb, nb_rx, beam_id, stream_id, w, &warned);
   combine_ul_weights(fft_data, nb_ant, k0, nk, w, out);
 }
 
@@ -166,14 +220,29 @@ void combine_ul_beam_prbs(const c16_t *const fft_data[],
                           const oru_codebook_t *cb,
                           int beam_id,
                           int stream_id,
+                          const oru_bfw_source_t *bfw,
+                          const oru_bfw_set_t *set,
                           c16_t *out)
 {
   const int n_rb = nbins / NR_NB_SC_PER_RB;
   int end = start_prb + num_prb;
   end = end < n_rb ? end : n_rb;
-  if (start_prb >= end)
-    return;
-  c16_t w[ORU_CODEBOOK_MAX_NB_TX];
-  const int nb_ant = codebook_ul_weights(cb, nb_rx, beam_id, stream_id, w);
-  combine_ul_weights_res(fft_data, nb_ant, fft_size, nbins, start_prb * NR_NB_SC_PER_RB, end * NR_NB_SC_PER_RB, w, out);
+  const oru_bfw_set_t no_bfw = {0};
+  if (stream_id >= cb->nb_fh_streams)
+    bfw = NULL; // codebook_ul_weights() drops the stream
+  bool warned = false; // once per job, not per bundle
+  for (int prb = start_prb; prb < end;) {
+    int bidx = beam_id;
+    c16_t w[ORU_MAX_BF_WEIGHTS];
+    int nb_ant;
+    const int run_end = bfw_run(bfw, set ? set : &no_bfw, prb, end, &bidx, w, &nb_ant);
+    if (nb_ant < 0)
+      nb_ant = 0; // combine_ul_weights() zeroes the run
+    else if (nb_ant == 0)
+      nb_ant = codebook_ul_weights(cb, nb_rx, bidx, stream_id, w, &warned);
+    else if (nb_ant > nb_rx)
+      nb_ant = nb_rx;
+    combine_ul_weights_res(fft_data, nb_ant, fft_size, nbins, prb * NR_NB_SC_PER_RB, run_end * NR_NB_SC_PER_RB, w, out);
+    prb = run_end;
+  }
 }
